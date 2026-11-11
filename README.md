@@ -1,17 +1,27 @@
-# jupyter-kernels
+# jupyter-ps
 
-Dependency-free Python 3 utility for Linux. Installed at `~/.local/bin/jupyter-kernels`.
+Dependency-free Python 3 utility for Linux. Install by copying the script to a
+folder on your `PATH` and making it executable:
 
 ```bash
-jupyter-kernels                       # running kernels, host PIDs, ROS evidence
-jupyter-kernels --details             # commands, cwd, evidence per descendant
-jupyter-kernels -i                    # choose PID and confirm TERM
-jupyter-kernels --kill 12345          # confirm then terminate kernel
-jupyter-kernels --kill 12345 --tree   # include current descendants
-jupyter-kernels --kill 12345 -s INT   # interrupt (kernel may keep running)
-jupyter-kernels --kill 12345 -s KILL  # force termination
-jupyter-kernels --kill 12345 --tree -y
-jupyter-kernels --json
+mkdir -p ~/.local/bin
+cp jupyter-ps ~/.local/bin/jupyter-ps
+chmod +x ~/.local/bin/jupyter-ps
+```
+
+Ensure `~/.local/bin` is on your `PATH`. Output columns are separated by tabs.
+
+```bash
+jupyter-ps                       # running kernels and host PIDs
+jupyter-ps --ros2                # also inspect ROS 2 evidence
+jupyter-ps --ros2 --details      # commands, cwd, ROS evidence per descendant
+jupyter-ps -i                    # choose PID and confirm TERM
+jupyter-ps --kill 12345          # confirm then terminate kernel
+jupyter-ps --kill 12345 --tree   # include current descendants
+jupyter-ps --kill 12345 -s INT   # interrupt (kernel may keep running)
+jupyter-ps --kill 12345 -s KILL  # force termination
+jupyter-ps --kill 12345 --tree -y
+jupyter-ps --json
 ```
 
 Lists running processes rather than installed kernel specifications or stale
@@ -20,6 +30,8 @@ connection files. Detects Python ipykernel launches and other kernels with a
 launch commands may not be detected. It does not infer whether a frontend is
 still attached. Age is process age, not notebook idle time.
 
+ROS detection runs only with `--ros2`, including for JSON output. Without this
+flag, process maps and environments are not inspected and ROS fields are omitted.
 ROS evidence includes the kernel and all visible descendants:
 
 - `loaded`: ROS client/middleware libraries appear in process memory maps.

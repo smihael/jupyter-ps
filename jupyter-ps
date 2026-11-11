@@ -8,7 +8,6 @@ import pwd
 import re
 import signal
 import sys
-import time
 
 PROC = Path('/proc')
 
@@ -80,10 +79,10 @@ def ros_evidence(p):
     return dict(pid=p['pid'], state=state, libraries=loaded)
 
 
-def describe(p, processes, uptime):
+def describe(p, processes, uptime, detect_ros=False):
     base = PROC / str(p['pid'])
     children = descendants(p['pid'], processes)
-    evidence = [ros_evidence(x) for x in [p] + children]
+    evidence = [ros_evidence(x) for x in [p] + children] if detect_ros else []
     states = [x['state'] for x in evidence]
     ros = next((x for x in ('loaded', 'command', 'env-only', 'unknown') if x in states), 'none-seen')
     cgroup = read(base / 'cgroup') or ''
@@ -97,10 +96,13 @@ def describe(p, processes, uptime):
     except OSError:
         container = False
     connection = next((a for a in p['args'] if re.search(r'kernel[-\w.]*\.json$', a)), '?')
-    return dict(**p, age_seconds=max(0, int(uptime - p['start'] / os.sysconf('SC_CLK_TCK'))),
-                children=[x['pid'] for x in children], ros=ros, ros_evidence=evidence,
+    result = dict(**p, age_seconds=max(0, int(uptime - p['start'] / os.sysconf('SC_CLK_TCK'))),
+                children=[x['pid'] for x in children],
                 location='docker:' + match[1][:12] if match else 'container' if container else 'host/?',
                 cwd=cwd, connection=connection)
+    if detect_ros:
+        result.update(ros=ros, ros_evidence=evidence)
+    return result
 
 
 def send(p, sig):
@@ -131,8 +133,9 @@ def main():
         'ROS: loaded=ROS libraries mapped; command=ROS executable; env-only=inherited setup; '
         'none-seen=no evidence; unknown=access restricted. These do not prove a live ROS node. '
         'Run on the host to see Docker kernels. Listing never sends signals.')
+    parser.add_argument('--ros2', action='store_true', help='inspect kernel and descendants for ROS 2 evidence')
     parser.add_argument('--json', action='store_true', help='machine-readable listing with evidence')
-    parser.add_argument('--details', action='store_true', help='show command, working directory and ROS evidence')
+    parser.add_argument('--details', action='store_true', help='show command, working directory and, with --ros2, ROS evidence')
     parser.add_argument('--kill', type=int, metavar='PID', help='signal one listed kernel by host PID')
     parser.add_argument('-s', '--signal', choices=['TERM', 'INT', 'KILL'], default='TERM')
     parser.add_argument('--tree', action='store_true', help='also signal its current descendants, children first')
@@ -148,23 +151,31 @@ def main():
             if p:
                 processes[p['pid']] = p
     uptime = float((PROC / 'uptime').read_text().split()[0])
-    kernels = [describe(p, processes, uptime) for p in processes.values() if is_kernel(p)]
+    kernels = [describe(p, processes, uptime, args.ros2) for p in processes.values() if is_kernel(p)]
     kernels.sort(key=lambda p: p['pid'])
     if args.json:
         print(json.dumps(kernels, indent=2))
         return 0
-    print(f"{'PID':>7} {'USER':<14} {'AGE':>8} {'KIDS':>4} {'ROS2':<10} {'LOCATION':<20} CONNECTION")
+    columns = ['PID', 'USER', 'AGE', 'KIDS']
+    if args.ros2:
+        columns.append('ROS2')
+    columns.extend(['LOCATION', 'CONNECTION'])
+    print('\t'.join(columns))
     for p in kernels:
         age = f"{p['age_seconds'] // 3600}h{p['age_seconds'] % 3600 // 60:02}m"
-        print(f"{p['pid']:>7} {p['user']:<14} {age:>8} {len(p['children']):>4} "
-              f"{p['ros']:<10} {p['location']:<20} {Path(p['connection']).name}")
+        values = [str(p['pid']), p['user'], age, str(len(p['children']))]
+        if args.ros2:
+            values.append(p['ros'])
+        values.extend([p['location'], Path(p['connection']).name])
+        print('\t'.join(value.replace('\t', '\\t').replace('\n', '\\n') for value in values))
         if args.details:
-            print(f"        cwd: {p['cwd']}\n        command: {p['args']!r}")
-            for e in p['ros_evidence']:
-                print(f"        ROS PID {e['pid']}: {e['state']} " + ', '.join(e['libraries']))
+            print(f"\tcwd:\t{p['cwd']!r}\n\tcommand:\t{p['args']!r}")
+            for e in p.get('ros_evidence', []):
+                print(f"\tROS PID {e['pid']}:\t{e['state']} " + ', '.join(e['libraries']))
     if not kernels:
         print('No running Jupyter kernels visible in this PID namespace.')
-    print('ROS2: loaded / command / env-only / none-seen / unknown. Use --details for evidence.')
+    if args.ros2:
+        print('ROS2: loaded / command / env-only / none-seen / unknown. Use --details for evidence.')
     target = args.kill
     if args.interactive and target is None:
         if not kernels:
