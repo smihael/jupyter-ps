@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Inspect and signal running Jupyter kernels on Linux; no dependencies."""
+import argparse
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import signal
+import sys
+import time
+
+PROC = Path('/proc')
+
+
+def read(path):
+    try:
+        return path.read_bytes().decode(errors='replace')
+    except (OSError, PermissionError):
+        return None
+
+
+def process(pid):
+    base = PROC / str(pid)
+    stat = read(base / 'stat')
+    cmd = read(base / 'cmdline')
+    if not stat or not cmd:
+        return None
+    fields = stat[stat.rfind(')') + 2:].split()
+    try:
+        uid = base.stat().st_uid
+        try:
+            user = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            user = str(uid)
+        return dict(pid=pid, ppid=int(fields[1]), start=int(fields[19]),
+                    user=user, args=cmd.rstrip('\0').split('\0'))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def is_kernel(p):
+    args = p['args']
+    # Match argument tokens, never arbitrary shell command text.
+    return any(a in ('ipykernel', 'ipykernel_launcher', 'ipykernel_launcher.py')
+               or Path(a).name == 'ipykernel_launcher.py' for a in args) or (
+        any(re.search(r'kernel[-\w.]*\.json$', a) for a in args)
+        and any(a in ('-f', '--connection-file') or a.startswith('--connection-file=')
+                for a in args))
+
+
+def descendants(pid, processes):
+    result = []
+    pending = [pid]
+    seen = {pid}
+    while pending:
+        parent = pending.pop()
+        for p in processes.values():
+            if p['ppid'] == parent and p['pid'] not in seen:
+                seen.add(p['pid'])
+                result.append(p)
+                pending.append(p['pid'])
+    return result
+
+
+def ros_evidence(p):
+    base = PROC / str(p['pid'])
+    maps = read(base / 'maps')
+    env = read(base / 'environ')
+    loaded = [] if maps is None else sorted(set(re.findall(
+        r'/[^\s]*(?:librcl\w*|_rclpy\w*|librmw\w*)[^\s]*', maps)))
+    args = p['args']
+    command = any(Path(a).name in ('ros2', 'ros2_control_node', 'component_container',
+                                  'component_container_mt') for a in args)
+    environment = env is not None and any(
+        x.startswith(('ROS_VERSION=2', 'ROS_DISTRO=', 'AMENT_PREFIX_PATH='))
+        for x in env.split('\0'))
+    state = 'loaded' if loaded else 'command' if command else 'env-only' if environment else (
+        'unknown' if maps is None or env is None else 'none-seen')
+    return dict(pid=p['pid'], state=state, libraries=loaded)
+
+
+def describe(p, processes, uptime):
+    base = PROC / str(p['pid'])
+    children = descendants(p['pid'], processes)
+    evidence = [ros_evidence(x) for x in [p] + children]
+    states = [x['state'] for x in evidence]
+    ros = next((x for x in ('loaded', 'command', 'env-only', 'unknown') if x in states), 'none-seen')
+    cgroup = read(base / 'cgroup') or ''
+    match = re.search(r'(?:docker[-/]|cri-containerd-)([a-f0-9]{12,64})', cgroup)
+    try:
+        cwd = os.readlink(base / 'cwd')
+    except OSError:
+        cwd = '?'
+    try:
+        container = (base / 'root/.dockerenv').exists()
+    except OSError:
+        container = False
+    connection = next((a for a in p['args'] if re.search(r'kernel[-\w.]*\.json$', a)), '?')
+    return dict(**p, age_seconds=max(0, int(uptime - p['start'] / os.sysconf('SC_CLK_TCK'))),
+                children=[x['pid'] for x in children], ros=ros, ros_evidence=evidence,
+                location='docker:' + match[1][:12] if match else 'container' if container else 'host/?',
+                cwd=cwd, connection=connection)
+
+
+def send(p, sig):
+    # pidfd pins the identity across the final check and signal delivery.
+    fd = None
+    try:
+        if hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal'):
+            fd = os.pidfd_open(p['pid'])
+        current = process(p['pid'])
+        if not current or current['start'] != p['start']:
+            raise ProcessLookupError('process exited or PID was reused')
+        if fd is not None:
+            signal.pidfd_send_signal(fd, sig)
+        else:
+            os.kill(p['pid'], sig)
+        print(f"Sent {sig.name} to PID {p['pid']}")
+        return True
+    except OSError as exc:
+        print(f"PID {p['pid']}: {exc}", file=sys.stderr)
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, epilog=
+        'ROS: loaded=ROS libraries mapped; command=ROS executable; env-only=inherited setup; '
+        'none-seen=no evidence; unknown=access restricted. These do not prove a live ROS node. '
+        'Run on the host to see Docker kernels. Listing never sends signals.')
+    parser.add_argument('--json', action='store_true', help='machine-readable listing with evidence')
+    parser.add_argument('--details', action='store_true', help='show command, working directory and ROS evidence')
+    parser.add_argument('--kill', type=int, metavar='PID', help='signal one listed kernel by host PID')
+    parser.add_argument('-s', '--signal', choices=['TERM', 'INT', 'KILL'], default='TERM')
+    parser.add_argument('--tree', action='store_true', help='also signal its current descendants, children first')
+    parser.add_argument('-y', '--yes', action='store_true', help='skip interactive signal confirmation')
+    parser.add_argument('-i', '--interactive', action='store_true', help='pick a kernel PID after listing')
+    args = parser.parse_args()
+    if args.json and (args.kill is not None or args.interactive):
+        parser.error('--json is only for listing')
+    processes = {}
+    for path in PROC.iterdir():
+        if path.name.isdecimal():
+            p = process(int(path.name))
+            if p:
+                processes[p['pid']] = p
+    uptime = float((PROC / 'uptime').read_text().split()[0])
+    kernels = [describe(p, processes, uptime) for p in processes.values() if is_kernel(p)]
+    kernels.sort(key=lambda p: p['pid'])
+    if args.json:
+        print(json.dumps(kernels, indent=2))
+        return 0
+    print(f"{'PID':>7} {'USER':<14} {'AGE':>8} {'KIDS':>4} {'ROS2':<10} {'LOCATION':<20} CONNECTION")
+    for p in kernels:
+        age = f"{p['age_seconds'] // 3600}h{p['age_seconds'] % 3600 // 60:02}m"
+        print(f"{p['pid']:>7} {p['user']:<14} {age:>8} {len(p['children']):>4} "
+              f"{p['ros']:<10} {p['location']:<20} {Path(p['connection']).name}")
+        if args.details:
+            print(f"        cwd: {p['cwd']}\n        command: {p['args']!r}")
+            for e in p['ros_evidence']:
+                print(f"        ROS PID {e['pid']}: {e['state']} " + ', '.join(e['libraries']))
+    if not kernels:
+        print('No running Jupyter kernels visible in this PID namespace.')
+    print('ROS2: loaded / command / env-only / none-seen / unknown. Use --details for evidence.')
+    target = args.kill
+    if args.interactive and target is None:
+        if not kernels:
+            return 0
+        try:
+            value = input('Kernel PID to signal (Enter to cancel): ').strip()
+            if not value:
+                return 0
+            target = int(value)
+        except (EOFError, ValueError):
+            print('No valid PID selected.', file=sys.stderr)
+            return 1
+    if target is None:
+        return 0
+    selected = next((p for p in kernels if p['pid'] == target), None)
+    if selected is None:
+        print('Refusing: PID is not a detected Jupyter kernel.', file=sys.stderr)
+        return 1
+    targets = ([processes[pid] for pid in reversed(selected['children'])] if args.tree else []) + [selected]
+    if not args.yes:
+        try:
+            answer = input(f"Send SIG{args.signal} to PID(s) {', '.join(str(p['pid']) for p in targets)}? [y/N] ")
+        except EOFError:
+            answer = ''
+        if answer.lower() not in ('y', 'yes'):
+            print('Cancelled.')
+            return 0
+    results = [send(p, getattr(signal, 'SIG' + args.signal)) for p in targets]
+    return 0 if all(results) else 1
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
