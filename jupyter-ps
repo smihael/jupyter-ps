@@ -136,13 +136,16 @@ def main():
     parser.add_argument('--ros2', action='store_true', help='inspect kernel and descendants for ROS 2 evidence')
     parser.add_argument('--json', action='store_true', help='machine-readable listing with evidence')
     parser.add_argument('--details', action='store_true', help='show command, working directory and, with --ros2, ROS evidence')
-    parser.add_argument('--kill', type=int, metavar='PID', help='signal one listed kernel by host PID')
-    parser.add_argument('-s', '--signal', choices=['TERM', 'INT', 'KILL'], default='TERM')
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--kill', type=int, metavar='PID', help='signal one listed kernel by host PID')
+    selection.add_argument('--killall', action='store_true', help='signal all detected Jupyter kernels')
+    parser.add_argument('-s', '--signal', choices=['TERM', 'INT', 'KILL'], default='TERM',
+                        help='signal to send (default: TERM; use KILL for stuck kernels)')
     parser.add_argument('--tree', action='store_true', help='also signal its current descendants, children first')
     parser.add_argument('-y', '--yes', action='store_true', help='skip interactive signal confirmation')
-    parser.add_argument('-i', '--interactive', action='store_true', help='pick a kernel PID after listing')
+    selection.add_argument('-i', '--interactive', action='store_true', help='pick a kernel PID after listing')
     args = parser.parse_args()
-    if args.json and (args.kill is not None or args.interactive):
+    if args.json and (args.kill is not None or args.killall or args.interactive):
         parser.error('--json is only for listing')
     processes = {}
     for path in PROC.iterdir():
@@ -188,13 +191,22 @@ def main():
         except (EOFError, ValueError):
             print('No valid PID selected.', file=sys.stderr)
             return 1
-    if target is None:
+    if target is None and not args.killall:
         return 0
-    selected = next((p for p in kernels if p['pid'] == target), None)
-    if selected is None:
+    selected = kernels if args.killall else [p for p in kernels if p['pid'] == target]
+    if not selected and not args.killall:
         print('Refusing: PID is not a detected Jupyter kernel.', file=sys.stderr)
         return 1
-    targets = ([processes[pid] for pid in reversed(selected['children'])] if args.tree else []) + [selected]
+    targets = []
+    seen = set()
+    for kernel in selected:
+        members = ([processes[pid] for pid in reversed(kernel['children'])] if args.tree else []) + [kernel]
+        for p in members:
+            if p['pid'] not in seen:
+                seen.add(p['pid'])
+                targets.append(p)
+    if not targets:
+        return 0
     if not args.yes:
         try:
             answer = input(f"Send SIG{args.signal} to PID(s) {', '.join(str(p['pid']) for p in targets)}? [y/N] ")

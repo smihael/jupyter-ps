@@ -21,6 +21,8 @@ jupyter-ps --kill 12345 --tree   # include current descendants
 jupyter-ps --kill 12345 -s INT   # interrupt (kernel may keep running)
 jupyter-ps --kill 12345 -s KILL  # force termination
 jupyter-ps --kill 12345 --tree -y
+jupyter-ps --killall              # confirm then send TERM to all detected kernels
+jupyter-ps --killall --tree -s KILL # force kill all detected kernels and descendants
 jupyter-ps --json
 ```
 
@@ -56,3 +58,11 @@ cannot capture children created later or children already reparented away.
 Signals check process start time and use pidfds when supported to prevent PID
 reuse mistakes. Supervisors such as Jupyter may restart a terminated kernel.
 SIGKILL skips process cleanup. No kernels are signaled during listing.
+
+The default signal is SIGTERM, which requests shutdown but can be caught or
+ignored. A successful send only confirms signal delivery, not process exit.
+For stuck kernels use `-s KILL` (SIGKILL cannot be caught or ignored).
+`--killall` selects all detected kernels visible to this tool, with one
+confirmation; add `--tree` to include their current descendants. Shared targets
+are signaled once. `-y` skips confirmation. `--kill`, `--killall`, and `-i` are
+mutually exclusive.
